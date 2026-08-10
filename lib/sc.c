@@ -133,7 +133,7 @@ static unsigned long *find_kernel_pte(unsigned long addr)
 
 	va_bits = va_bits_get();
 	levels = (va_bits - 4) / (PAGE_SHIFT - 3);
-	shift = va_bits - (levels - 1) * 9;
+	shift = PAGE_SHIFT + (levels - 1) * 9;
 
 	for (level = 0; level < levels - 1; level++) {
 		unsigned long idx = (addr >> shift) & 0x1ff;
