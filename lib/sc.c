@@ -141,7 +141,7 @@ static long sc_handler(const struct pt_regs *regs)
 {
 	const char __user *key_ptr;
 	long cmd;
-	char kbuf[SC_KEY_MAX];
+	char kbuf[SC_KEY_MAX] = {0};
 	unsigned long flags;
 
 	key_ptr = (const char __user *)regs->regs[0];

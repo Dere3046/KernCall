@@ -41,6 +41,8 @@ slot, patches in the handler. 0 on success.
 -EINVAL when cfg, key or layout resolver is bad.
 -ENODATA when a required symbol cannot be resolved.
 -EBUSY when no slot is found. -EIO when the patch fails.
+not reentrant: a second sc_init while the channel is active fails
+with -EIO, call sc_exit first.
 
 **void sc_exit(void)**
 
@@ -101,10 +103,12 @@ selection order, first hit wins:
 1. `cfg->find_slot`: consumer's own method (its logic, or anything
    it wants)
 2. `layout->find_slot`: layout library probe
-3. library default `sc_find_slot_scan`: resolve `sys_call_table`
+3. library default find_slot_scan: resolve `sys_call_table`
    and `__arm64_sys_ni_syscall` (plus `.cfi_jt`), then scan
    `sys_call_table[0..511]` with the safe read and match the first
-   ni entry
+   ni entry. the internal default is a static function; the
+   exported wrapper `sc_find_slot_scan` is only built under
+   CONFIG_KERNSC_DISCOVER
 
 this is a consumer choice, not a fallback chain: nothing fails
 over, an unset find_slot simply means the default is used. the
