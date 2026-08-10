@@ -65,16 +65,32 @@ static unsigned long va_bits_get(void)
 {
 	unsigned long fn;
 	u32 v;
+	static bool reported;
 
 	fn = resolve("vabits_actual");
 	if (fn && ker_addr_ok(fn) &&
 	    !sc_safe_read(&v, (void *)fn, sizeof(v)) &&
-	    (v == 48 || v == 52))
+	    (v == 48 || v == 52)) {
+		if (!reported) {
+			pr_info("[kerncall] va_bits=%u (vabits_actual)\n", v);
+			reported = true;
+		}
 		return v;
+	}
 	fn = resolve("pgtable_l5_enabled");
 	if (fn && ker_addr_ok(fn) &&
-	    !sc_safe_read(&v, (void *)fn, sizeof(v)))
+	    !sc_safe_read(&v, (void *)fn, sizeof(v))) {
+		if (!reported) {
+			pr_info("[kerncall] va_bits=%s (pgtable_l5_enabled)\n",
+				v ? "52" : "48");
+			reported = true;
+		}
 		return v ? 52 : 48;
+	}
+	if (!reported) {
+		pr_info("[kerncall] va_bits=48 (fallback)\n");
+		reported = true;
+	}
 	return 48;
 }
 static __nocfi void call_clean_inval(unsigned long start, unsigned long end)
