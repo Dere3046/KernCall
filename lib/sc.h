@@ -32,6 +32,7 @@ struct sc_cfg {
 	int (*find_slot)(void);
 	char key[SC_KEY_MAX];
 	void *priv;
+	bool no_patch;
 };
 
 int sc_init(const struct sc_cfg *cfg);

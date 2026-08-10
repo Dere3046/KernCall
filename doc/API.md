@@ -44,6 +44,12 @@ slot, patches in the handler. 0 on success.
 not reentrant: a second sc_init while the channel is active fails
 with -EIO, call sc_exit first.
 
+with `cfg->no_patch` set, sc_init only resolves the layout
+(symbols + pgd ready) and returns without discovering or patching
+a channel slot. consumers use this to build their own handler on
+top of the patch API, keeping the built-in channel (and its auth
+error codes) out of the syscall table.
+
 **void sc_exit(void)**
 
 restores every patched slot and unregisters. safe to call multiple

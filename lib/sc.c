@@ -308,6 +308,11 @@ int sc_init(const struct sc_cfg *cfg)
 		return -ENODATA;
 	}
 
+	if (cfg->no_patch) {
+		pr_info("[kerncall] layout ready, channel not hooked\n");
+		return 0;
+	}
+
 	slot = find_slot_inner();
 	if (slot < 0) {
 		pr_warn("[kerncall] no free syscall slot found\n");
