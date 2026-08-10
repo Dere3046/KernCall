@@ -61,95 +61,22 @@ static bool table_ptr_ok(unsigned long v)
 	return v >= TASK_SIZE && !(v & (PAGE_SIZE - 1));
 }
 
-static unsigned long va_bits_get(void)
+static bool pte_phys_ok(unsigned long entry)
 {
-	unsigned long fn;
-	u32 v;
-	static bool reported;
+	unsigned long phys = __pte_to_phys(__pte(entry));
 
-	fn = resolve("vabits_actual");
-	pr_info("[kerncall] vabits_actual resolve=0x%lx\n", fn);
-	if (fn && ker_addr_ok(fn) &&
-	    !sc_safe_read(&v, (void *)fn, sizeof(v)) &&
-	    (v == 48 || v == 52)) {
-		if (!reported) {
-			pr_info("[kerncall] va_bits=%u (vabits_actual)\n", v);
-			reported = true;
-		}
-		return v;
-	}
-	fn = resolve("pgtable_l5_enabled");
-	pr_info("[kerncall] pgtable_l5_enabled resolve=0x%lx\n", fn);
-	if (fn && ker_addr_ok(fn) &&
-	    !sc_safe_read(&v, (void *)fn, sizeof(v))) {
-		if (!reported) {
-			pr_info("[kerncall] va_bits=%s (pgtable_l5_enabled)\n",
-				v ? "52" : "48");
-			reported = true;
-		}
-		return v ? 52 : 48;
-	}
-	if (!reported) {
-		pr_info("[kerncall] va_bits=48 (fallback)\n");
-		reported = true;
-	}
-	return 48;
-}
-static __nocfi void call_clean_inval(unsigned long start, unsigned long end)
-{
-	if (!g_clean_inval) {
-		g_clean_inval = (clean_inval_fn)resolve("caches_clean_inval_pou");
-		if (!g_clean_inval) {
-			pr_warn("[kerncall] caches_clean_inval_pou not found\n");
-			return;
-		}
-		if (!ker_addr_ok((unsigned long)g_clean_inval)) {
-			pr_warn("[kerncall] bad caches_clean_inval_pou addr %px\n",
-				g_clean_inval);
-			g_clean_inval = NULL;
-			return;
-		}
-	}
-	g_clean_inval(start, end);
+	return phys && !(phys & (PAGE_SIZE - 1)) && phys < (1UL << 40);
 }
 
-static unsigned long *find_kernel_pte(unsigned long addr)
+static unsigned long *pte_walk(unsigned long addr, unsigned long va_bits)
 {
 	struct sc_slide_win w;
 	unsigned long table = spg_dir;
-	unsigned long va_bits;
 	unsigned long shift;
 	unsigned long entry;
 	int levels;
 	int level;
 
-	if (!spg_dir) {
-		u32 pgd_off;
-		unsigned long pgd_val;
-
-		if (!g_layout || !g_layout->pgd_off) {
-			pr_warn("[kerncall] no pgd resolver\n");
-			return NULL;
-		}
-		if (g_layout->pgd_off(&pgd_off)) {
-			pr_warn("[kerncall] no pgd offset\n");
-			return NULL;
-		}
-		if (sc_safe_read(&pgd_val, (void *)(init_mm_addr + pgd_off),
-				 sizeof(pgd_val))) {
-			pr_warn("[kerncall] no pgd\n");
-			return NULL;
-		}
-		spg_dir = pgd_val;
-		if (!spg_dir || !table_ptr_ok(spg_dir)) {
-			pr_warn("[kerncall] bad pgd %px\n", (void *)spg_dir);
-			spg_dir = 0;
-			return NULL;
-		}
-		table = spg_dir;
-	}
-
-	va_bits = va_bits_get();
 	levels = (va_bits - 4) / (PAGE_SHIFT - 3);
 	shift = PAGE_SHIFT + (levels - 1) * 9;
 
@@ -179,6 +106,120 @@ static unsigned long *find_kernel_pte(unsigned long addr)
 		return (unsigned long *)(table + idx * 8);
 	}
 }
+
+static unsigned long va_bits_symbol(void)
+{
+	unsigned long fn;
+	u32 v;
+
+	fn = resolve("vabits_actual");
+	if (fn && ker_addr_ok(fn) &&
+	    !sc_safe_read(&v, (void *)fn, sizeof(v)) &&
+	    (v == 48 || v == 52))
+		return v;
+	fn = resolve("pgtable_l5_enabled");
+	if (fn && ker_addr_ok(fn) &&
+	    !sc_safe_read(&v, (void *)fn, sizeof(v)))
+		return v ? 52 : 48;
+	return 0;
+}
+
+static unsigned long *find_kernel_pte(unsigned long addr)
+{
+	unsigned long cand[3];
+	int ncand = 0;
+	int i;
+
+	if (!spg_dir) {
+		u32 pgd_off;
+		unsigned long pgd_val;
+
+		if (!g_layout || !g_layout->pgd_off) {
+			pr_warn("[kerncall] no pgd resolver\n");
+			return NULL;
+		}
+		if (g_layout->pgd_off(&pgd_off)) {
+			pr_warn("[kerncall] no pgd offset\n");
+			return NULL;
+		}
+		if (sc_safe_read(&pgd_val, (void *)(init_mm_addr + pgd_off),
+				 sizeof(pgd_val))) {
+			pr_warn("[kerncall] no pgd\n");
+			return NULL;
+		}
+		spg_dir = pgd_val;
+		if (!spg_dir || !table_ptr_ok(spg_dir)) {
+			pr_warn("[kerncall] bad pgd %px\n", (void *)spg_dir);
+			spg_dir = 0;
+			return NULL;
+		}
+	}
+
+#if defined(CONFIG_ARM64_VA_BITS_39)
+	cand[ncand++] = 39;
+#elif defined(CONFIG_ARM64_VA_BITS_48)
+	cand[ncand++] = 48;
+#elif defined(CONFIG_ARM64_VA_BITS_52)
+	cand[ncand++] = 52;
+#endif
+	{
+		unsigned long va = va_bits_symbol();
+		int j;
+
+		if (va)
+			for (j = 0; j < ncand; j++)
+				if (cand[j] == va)
+					va = 0;
+		if (va)
+			cand[ncand++] = va;
+	}
+	if (ncand < 3) {
+		unsigned long all[] = { 39, 48, 52 };
+		int j;
+		int k;
+
+		for (j = 0; j < 3; j++) {
+			int dup = 0;
+
+			for (k = 0; k < ncand; k++)
+				if (cand[k] == all[j])
+					dup = 1;
+			if (!dup)
+				cand[ncand++] = all[j];
+		}
+	}
+
+	for (i = 0; i < ncand; i++) {
+		unsigned long *ptep = pte_walk(addr, cand[i]);
+
+		if (!ptep)
+			continue;
+		if (!pte_phys_ok(*(unsigned long *)ptep))
+			continue;
+		pr_info("[kerncall] pte walk va_bits=%lu\n", cand[i]);
+		return ptep;
+	}
+	pr_warn("[kerncall] no pte for %px\n", (void *)addr);
+	return NULL;
+}
+static __nocfi void call_clean_inval(unsigned long start, unsigned long end)
+{
+	if (!g_clean_inval) {
+		g_clean_inval = (clean_inval_fn)resolve("caches_clean_inval_pou");
+		if (!g_clean_inval) {
+			pr_warn("[kerncall] caches_clean_inval_pou not found\n");
+			return;
+		}
+		if (!ker_addr_ok((unsigned long)g_clean_inval)) {
+			pr_warn("[kerncall] bad caches_clean_inval_pou addr %px\n",
+				g_clean_inval);
+			g_clean_inval = NULL;
+			return;
+		}
+	}
+	g_clean_inval(start, end);
+}
+
 
 static int patch_write(void *addr, unsigned long val)
 {
