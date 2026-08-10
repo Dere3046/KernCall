@@ -117,19 +117,19 @@ static unsigned long *find_kernel_pte(unsigned long addr)
 	pgde = pgd_offset_pgd((pgd_t *)spg_dir, addr);
 	if (pgd_none(*pgde) || pgd_bad(*pgde))
 		return NULL;
-	if (!table_ptr_ok(pgd_val(*pgde)))
+	if (!table_ptr_ok(pgd_page_vaddr(pgd_val(*pgde))))
 		return NULL;
 	p4d = p4d_offset(pgde, addr);
 	if (p4d_none(*p4d))
 		return NULL;
-	if (!table_ptr_ok(p4d_val(*p4d)))
+	if (!table_ptr_ok(p4d_page_vaddr(p4d_val(*p4d))))
 		return NULL;
 	pud = pud_offset(p4d, addr);
 	if (pud_none(*pud))
 		return NULL;
 	if (pud_leaf(*pud))
 		return (unsigned long *)pud;
-	if (!table_ptr_ok(pud_val(*pud)))
+	if (!table_ptr_ok(pud_page_vaddr(pud_val(*pud))))
 		return NULL;
 	pmd = pmd_offset(pud, addr);
 	if (pmd_none(*pmd))
@@ -138,7 +138,7 @@ static unsigned long *find_kernel_pte(unsigned long addr)
 		return (unsigned long *)pmd;
 	if (!pmd_table(*pmd))
 		return NULL;
-	if (!table_ptr_ok(pmd_val(*pmd)))
+	if (!table_ptr_ok(pmd_page_vaddr(pmd_val(*pmd))))
 		return NULL;
 	return (unsigned long *)pte_offset_kernel(pmd, addr);
 }
