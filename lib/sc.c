@@ -50,12 +50,28 @@ static int sc_safe_read(void *dst, const void *src, size_t sz)
 	return copy_from_kernel_nofault(dst, src, sz);
 }
 
+static bool ker_addr_ok(unsigned long v)
+{
+	return v >= TASK_SIZE;
+}
+
+static bool table_ptr_ok(unsigned long v)
+{
+	return v >= TASK_SIZE && !(v & (PAGE_SIZE - 1));
+}
+
 static __nocfi void call_clean_inval(unsigned long start, unsigned long end)
 {
 	if (!g_clean_inval) {
 		g_clean_inval = (clean_inval_fn)resolve("caches_clean_inval_pou");
 		if (!g_clean_inval) {
 			pr_warn("[kerncall] caches_clean_inval_pou not found\n");
+			return;
+		}
+		if (!ker_addr_ok((unsigned long)g_clean_inval)) {
+			pr_warn("[kerncall] bad caches_clean_inval_pou addr %px\n",
+				g_clean_inval);
+			g_clean_inval = NULL;
 			return;
 		}
 	}
@@ -91,19 +107,30 @@ static unsigned long *find_kernel_pte(unsigned long addr)
 			pr_warn("[kerncall] no pgd\n");
 			return NULL;
 		}
+		if (!table_ptr_ok(spg_dir)) {
+			pr_warn("[kerncall] bad pgd %px\n", (void *)spg_dir);
+			spg_dir = 0;
+			return NULL;
+		}
 	}
 
 	pgde = pgd_offset_pgd((pgd_t *)spg_dir, addr);
 	if (pgd_none(*pgde) || pgd_bad(*pgde))
 		return NULL;
+	if (!table_ptr_ok(pgd_val(*pgde)))
+		return NULL;
 	p4d = p4d_offset(pgde, addr);
 	if (p4d_none(*p4d))
+		return NULL;
+	if (!table_ptr_ok(p4d_val(*p4d)))
 		return NULL;
 	pud = pud_offset(p4d, addr);
 	if (pud_none(*pud))
 		return NULL;
 	if (pud_leaf(*pud))
 		return (unsigned long *)pud;
+	if (!table_ptr_ok(pud_val(*pud)))
+		return NULL;
 	pmd = pmd_offset(pud, addr);
 	if (pmd_none(*pmd))
 		return NULL;
@@ -111,10 +138,12 @@ static unsigned long *find_kernel_pte(unsigned long addr)
 		return (unsigned long *)pmd;
 	if (!pmd_table(*pmd))
 		return NULL;
+	if (!table_ptr_ok(pmd_val(*pmd)))
+		return NULL;
 	return (unsigned long *)pte_offset_kernel(pmd, addr);
 }
 
-static void patch_write(void *addr, unsigned long val)
+static int patch_write(void *addr, unsigned long val)
 {
 	unsigned long *ptep;
 	unsigned long orig;
@@ -122,7 +151,7 @@ static void patch_write(void *addr, unsigned long val)
 	ptep = find_kernel_pte((unsigned long)addr);
 	if (!ptep) {
 		pr_warn("[kerncall] no pte for %px\n", addr);
-		return;
+		return -EIO;
 	}
 
 	orig = *ptep;
@@ -135,6 +164,7 @@ static void patch_write(void *addr, unsigned long val)
 	dsb(ish);
 	flush_tlb_kernel_range((unsigned long)addr, (unsigned long)addr + 8);
 	call_clean_inval((unsigned long)addr, (unsigned long)addr + 8);
+	return 0;
 }
 
 static long sc_handler(const struct pt_regs *regs)
@@ -238,10 +268,16 @@ static int patch_slot(unsigned long nr, unsigned long handler,
 	}
 	for (i = 0; i < SC_PATCH_MAX; i++) {
 		if (!g_patches[i].used) {
+			int ret;
+
 			g_patches[i].nr = nr;
 			g_patches[i].orig = orig;
 			g_patches[i].used = true;
-			patch_write(&sys_call_table[nr], handler);
+			ret = patch_write(&sys_call_table[nr], handler);
+			if (ret) {
+				g_patches[i].used = false;
+				return ret;
+			}
 			if (orig_out)
 				*orig_out = orig;
 			return 0;
