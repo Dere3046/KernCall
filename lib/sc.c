@@ -13,6 +13,7 @@
 #include <linux/mm.h>
 #include <asm/pgtable.h>
 #include <asm/tlbflush.h>
+#include <asm/fixmap.h>
 
 #include "sc.h"
 #include "sc_slide.h"
@@ -56,162 +57,43 @@ static bool ker_addr_ok(unsigned long v)
 	return v >= TASK_SIZE;
 }
 
-static bool table_ptr_ok(unsigned long v)
+static unsigned long find_kernel_phys(unsigned long addr)
 {
-	return v >= TASK_SIZE && !(v & (PAGE_SIZE - 1));
+	static unsigned long kimage_voffset;
+	unsigned long voff;
+
+	if (!kimage_voffset) {
+		unsigned long fn = resolve("kimage_voffset");
+
+		if (!fn || !ker_addr_ok(fn)) {
+			pr_warn("[kerncall] kimage_voffset not found\n");
+			return 0;
+		}
+		if (sc_safe_read(&voff, (void *)fn, sizeof(voff))) {
+			pr_warn("[kerncall] kimage_voffset unreadable\n");
+			return 0;
+		}
+		kimage_voffset = voff;
+	}
+	return (unsigned long)addr - kimage_voffset;
 }
 
-static bool pte_phys_ok(unsigned long entry)
-{
-	unsigned long phys = __pte_to_phys(__pte(entry));
-
-	return phys && !(phys & (PAGE_SIZE - 1)) && phys < (1UL << 40);
-}
-
-static unsigned long *pte_walk(unsigned long addr, unsigned long va_bits)
-{
-	struct sc_slide_win w;
-	unsigned long table = spg_dir;
-	unsigned long shift;
-	unsigned long entry;
-	int levels;
-	int level;
-
-	levels = (va_bits - 4) / (PAGE_SHIFT - 3);
-	shift = PAGE_SHIFT + (levels - 1) * 9;
-
-	for (level = 0; level < levels - 1; level++) {
-		unsigned long idx = (addr >> shift) & 0x1ff;
-
-		if (sc_slide_init(&w, table, PAGE_SIZE, 0))
-			return NULL;
-		entry = *(unsigned long *)(sc_slide_ptr(&w, sc_slide_buf) +
-					   idx * 8);
-		if (entry & BIT(1))
-			return (unsigned long *)(table + idx * 8);
-		if (!table_ptr_ok((unsigned long)__va(__pte_to_phys(__pte(entry)))))
-			return NULL;
-		table = (unsigned long)__va(__pte_to_phys(__pte(entry)));
-		shift -= 9;
-	}
-	{
-		unsigned long idx = (addr >> shift) & 0x1ff;
-
-		if (sc_slide_init(&w, table, PAGE_SIZE, 0))
-			return NULL;
-		entry = *(unsigned long *)(sc_slide_ptr(&w, sc_slide_buf) +
-					   idx * 8);
-		if (!pte_present(__pte(entry)))
-			return NULL;
-		return (unsigned long *)(table + idx * 8);
-	}
-}
-
-static unsigned long va_bits_symbol(void)
-{
-	unsigned long fn;
-	u32 v;
-
-	fn = resolve("vabits_actual");
-	if (fn && ker_addr_ok(fn) &&
-	    !sc_safe_read(&v, (void *)fn, sizeof(v)) &&
-	    (v == 48 || v == 52))
-		return v;
-	fn = resolve("pgtable_l5_enabled");
-	if (fn && ker_addr_ok(fn) &&
-	    !sc_safe_read(&v, (void *)fn, sizeof(v)))
-		return v ? 52 : 48;
-	return 0;
-}
-
-static unsigned long *find_kernel_pte(unsigned long addr)
-{
-	unsigned long cand[3];
-	int ncand = 0;
-	int i;
-
-	if (!spg_dir) {
-		u32 pgd_off;
-		unsigned long pgd_val;
-
-		if (!g_layout || !g_layout->pgd_off) {
-			pr_warn("[kerncall] no pgd resolver\n");
-			return NULL;
-		}
-		if (g_layout->pgd_off(&pgd_off)) {
-			pr_warn("[kerncall] no pgd offset\n");
-			return NULL;
-		}
-		if (sc_safe_read(&pgd_val, (void *)(init_mm_addr + pgd_off),
-				 sizeof(pgd_val))) {
-			pr_warn("[kerncall] no pgd\n");
-			return NULL;
-		}
-		spg_dir = pgd_val;
-		if (!spg_dir || !table_ptr_ok(spg_dir)) {
-			pr_warn("[kerncall] bad pgd %px\n", (void *)spg_dir);
-			spg_dir = 0;
-			return NULL;
-		}
-	}
-
-#if defined(CONFIG_ARM64_VA_BITS_39)
-	cand[ncand++] = 39;
-#elif defined(CONFIG_ARM64_VA_BITS_48)
-	cand[ncand++] = 48;
-#elif defined(CONFIG_ARM64_VA_BITS_52)
-	cand[ncand++] = 52;
-#endif
-	{
-		unsigned long va = va_bits_symbol();
-		int j;
-
-		if (va)
-			for (j = 0; j < ncand; j++)
-				if (cand[j] == va)
-					va = 0;
-		if (va)
-			cand[ncand++] = va;
-	}
-	if (ncand < 3) {
-		unsigned long all[] = { 39, 48, 52 };
-		int j;
-		int k;
-
-		for (j = 0; j < 3; j++) {
-			int dup = 0;
-
-			for (k = 0; k < ncand; k++)
-				if (cand[k] == all[j])
-					dup = 1;
-			if (!dup)
-				cand[ncand++] = all[j];
-		}
-	}
-
-	for (i = 0; i < ncand; i++) {
-		unsigned long *ptep = pte_walk(addr, cand[i]);
-
-		if (!ptep)
-			continue;
-		if (!pte_phys_ok(*(unsigned long *)ptep))
-			continue;
-		pr_info("[kerncall] pte walk va_bits=%lu\n", cand[i]);
-		return ptep;
-	}
-	pr_warn("[kerncall] no pte for %px\n", (void *)addr);
-	return NULL;
-}
 static __nocfi void call_clean_inval(unsigned long start, unsigned long end)
 {
 	if (!g_clean_inval) {
 		g_clean_inval = (clean_inval_fn)resolve("caches_clean_inval_pou");
+		if (!g_clean_inval)
+			g_clean_inval = (clean_inval_fn)resolve(
+				"dcache_clean_inval_poc");
+		if (!g_clean_inval)
+			g_clean_inval = (clean_inval_fn)resolve(
+				"flush_dcache_range");
 		if (!g_clean_inval) {
-			pr_warn("[kerncall] caches_clean_inval_pou not found\n");
+			pr_warn("[kerncall] no cache clean fn\n");
 			return;
 		}
 		if (!ker_addr_ok((unsigned long)g_clean_inval)) {
-			pr_warn("[kerncall] bad caches_clean_inval_pou addr %px\n",
+			pr_warn("[kerncall] bad cache clean addr %px\n",
 				g_clean_inval);
 			g_clean_inval = NULL;
 			return;
@@ -221,26 +103,48 @@ static __nocfi void call_clean_inval(unsigned long start, unsigned long end)
 }
 
 
+typedef void (*fixmap_fn)(unsigned long idx, phys_addr_t phys,
+			  pgprot_t prot);
+
+static fixmap_fn g_set_fixmap;
+
+static __nocfi void call_set_fixmap(unsigned long idx, phys_addr_t phys,
+				    pgprot_t prot)
+{
+	if (!g_set_fixmap) {
+		g_set_fixmap = (fixmap_fn)resolve("__set_fixmap");
+		if (!g_set_fixmap) {
+			pr_warn("[kerncall] __set_fixmap not found\n");
+			return;
+		}
+		if (!ker_addr_ok((unsigned long)g_set_fixmap)) {
+			pr_warn("[kerncall] bad __set_fixmap addr %px\n",
+				g_set_fixmap);
+			g_set_fixmap = NULL;
+			return;
+		}
+	}
+	g_set_fixmap(idx, phys, prot);
+}
+
 static int patch_write(void *addr, unsigned long val)
 {
-	unsigned long *ptep;
-	unsigned long orig;
+	unsigned long phys;
+	unsigned long fixmap_va;
+	unsigned long flags;
 
-	ptep = find_kernel_pte((unsigned long)addr);
-	if (!ptep) {
-		pr_warn("[kerncall] no pte for %px\n", addr);
+	phys = find_kernel_phys((unsigned long)addr);
+	if (!phys)
 		return -EIO;
-	}
 
-	orig = *ptep;
-	*ptep = (orig | PTE_DBM) & ~PTE_RDONLY;
+	spin_lock_irqsave(&sc_lock, flags);
+	call_set_fixmap(FIX_TEXT_POKE0, phys & PAGE_MASK, PAGE_KERNEL);
+	fixmap_va = fix_to_virt(FIX_TEXT_POKE0) + (phys & ~PAGE_MASK);
+	*(unsigned long *)fixmap_va = val;
 	dsb(ish);
+	call_set_fixmap(FIX_TEXT_POKE0, 0, __pgprot(0));
+	spin_unlock_irqrestore(&sc_lock, flags);
 
-	*(unsigned long *)addr = val;
-
-	*ptep = orig;
-	dsb(ish);
-	flush_tlb_kernel_range((unsigned long)addr, (unsigned long)addr + 8);
 	call_clean_inval((unsigned long)addr, (unsigned long)addr + 8);
 	return 0;
 }
