@@ -1,6 +1,0 @@
-[submodule "deps/KallRecon"]
-	path = deps/KallRecon
-	url = git@github.com:Dere3046/KallRecon.git
-[submodule "deps/type_info"]
-	path = deps/type_info
-	url = git@github.com:Dere3046/Type_info.git
