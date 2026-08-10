@@ -15,6 +15,7 @@
 #include <asm/tlbflush.h>
 
 #include "sc.h"
+#include "sc_slide.h"
 
 #define SC_PATCH_MAX 16
 
@@ -45,7 +46,7 @@ static unsigned long resolve(const char *name)
 	return 0;
 }
 
-static int sc_safe_read(void *dst, const void *src, size_t sz)
+int sc_safe_read(void *dst, const void *src, size_t sz)
 {
 	return copy_from_kernel_nofault(dst, src, sz);
 }
@@ -60,13 +61,22 @@ static bool table_ptr_ok(unsigned long v)
 	return v >= TASK_SIZE && !(v & (PAGE_SIZE - 1));
 }
 
-static bool table_entry_ok(unsigned long entry)
+static unsigned long va_bits_get(void)
 {
-	unsigned long phys = __pte_to_phys(__pte(entry));
+	unsigned long fn;
+	u32 v;
 
-	return phys && !(phys & (PAGE_SIZE - 1)) && phys < (1UL << 52);
+	fn = resolve("vabits_actual");
+	if (fn && ker_addr_ok(fn) &&
+	    !sc_safe_read(&v, (void *)fn, sizeof(v)) &&
+	    (v == 48 || v == 52))
+		return v;
+	fn = resolve("pgtable_l5_enabled");
+	if (fn && ker_addr_ok(fn) &&
+	    !sc_safe_read(&v, (void *)fn, sizeof(v)))
+		return v ? 52 : 48;
+	return 48;
 }
-
 static __nocfi void call_clean_inval(unsigned long start, unsigned long end)
 {
 	if (!g_clean_inval) {
@@ -87,15 +97,18 @@ static __nocfi void call_clean_inval(unsigned long start, unsigned long end)
 
 static unsigned long *find_kernel_pte(unsigned long addr)
 {
-	pgd_t *pgd;
-	pgd_t *pgde;
-	p4d_t *p4d;
-	pud_t *pud;
-	pmd_t *pmd;
-	u32 pgd_off;
-	unsigned long pgd_val;
+	struct sc_slide_win w;
+	unsigned long table = spg_dir;
+	unsigned long va_bits;
+	unsigned long shift;
+	unsigned long entry;
+	int levels;
+	int level;
 
 	if (!spg_dir) {
+		u32 pgd_off;
+		unsigned long pgd_val;
+
 		if (!g_layout || !g_layout->pgd_off) {
 			pr_warn("[kerncall] no pgd resolver\n");
 			return NULL;
@@ -110,44 +123,43 @@ static unsigned long *find_kernel_pte(unsigned long addr)
 			return NULL;
 		}
 		spg_dir = pgd_val;
-		if (!spg_dir) {
-			pr_warn("[kerncall] no pgd\n");
-			return NULL;
-		}
-		if (!table_ptr_ok(spg_dir)) {
+		if (!spg_dir || !table_ptr_ok(spg_dir)) {
 			pr_warn("[kerncall] bad pgd %px\n", (void *)spg_dir);
 			spg_dir = 0;
 			return NULL;
 		}
+		table = spg_dir;
 	}
 
-	pgde = pgd_offset_pgd((pgd_t *)spg_dir, addr);
-	if (pgd_none(*pgde) || pgd_bad(*pgde))
-		return NULL;
-	if (!table_entry_ok(pgd_val(*pgde)))
-		return NULL;
-	p4d = p4d_offset(pgde, addr);
-	if (p4d_none(*p4d))
-		return NULL;
-	if (!table_entry_ok(p4d_val(*p4d)))
-		return NULL;
-	pud = pud_offset(p4d, addr);
-	if (pud_none(*pud))
-		return NULL;
-	if (pud_leaf(*pud))
-		return (unsigned long *)pud;
-	if (!table_entry_ok(pud_val(*pud)))
-		return NULL;
-	pmd = pmd_offset(pud, addr);
-	if (pmd_none(*pmd))
-		return NULL;
-	if (pmd_leaf(*pmd))
-		return (unsigned long *)pmd;
-	if (!pmd_table(*pmd))
-		return NULL;
-	if (!table_entry_ok(pmd_val(*pmd)))
-		return NULL;
-	return (unsigned long *)pte_offset_kernel(pmd, addr);
+	va_bits = va_bits_get();
+	levels = (va_bits - 4) / (PAGE_SHIFT - 3);
+	shift = va_bits - (levels - 1) * 9;
+
+	for (level = 0; level < levels - 1; level++) {
+		unsigned long idx = (addr >> shift) & 0x1ff;
+
+		if (sc_slide_init(&w, table, PAGE_SIZE, 0))
+			return NULL;
+		entry = *(unsigned long *)(sc_slide_ptr(&w, sc_slide_buf) +
+					   idx * 8);
+		if (entry & BIT(1))
+			return (unsigned long *)(table + idx * 8);
+		if (!table_ptr_ok((unsigned long)__va(__pte_to_phys(__pte(entry)))))
+			return NULL;
+		table = (unsigned long)__va(__pte_to_phys(__pte(entry)));
+		shift -= 9;
+	}
+	{
+		unsigned long idx = (addr >> shift) & 0x1ff;
+
+		if (sc_slide_init(&w, table, PAGE_SIZE, 0))
+			return NULL;
+		entry = *(unsigned long *)(sc_slide_ptr(&w, sc_slide_buf) +
+					   idx * 8);
+		if (!pte_present(__pte(entry)))
+			return NULL;
+		return (unsigned long *)(table + idx * 8);
+	}
 }
 
 static int patch_write(void *addr, unsigned long val)

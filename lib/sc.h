@@ -38,6 +38,7 @@ struct sc_cfg {
 int sc_init(const struct sc_cfg *cfg);
 void sc_exit(void);
 int sc_get_slot(void);
+int sc_safe_read(void *dst, const void *src, size_t sz);
 
 #ifdef CONFIG_KERNSC_DISCOVER
 unsigned long sc_table_addr(void);

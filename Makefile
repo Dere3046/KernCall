@@ -1,6 +1,6 @@
 obj-m := kerncall.o
 
-kerncall-y := src/main.o lib/sc.o \
+kerncall-y := src/main.o lib/sc.o lib/sc_slide.o \
 	deps/KallRecon/lib/core.o deps/KallRecon/lib/slide.o deps/KallRecon/lib/anchor.o
 
 ccflags-y += -std=gnu11
