@@ -68,6 +68,7 @@ static unsigned long va_bits_get(void)
 	static bool reported;
 
 	fn = resolve("vabits_actual");
+	pr_info("[kerncall] vabits_actual resolve=0x%lx\n", fn);
 	if (fn && ker_addr_ok(fn) &&
 	    !sc_safe_read(&v, (void *)fn, sizeof(v)) &&
 	    (v == 48 || v == 52)) {
@@ -78,6 +79,7 @@ static unsigned long va_bits_get(void)
 		return v;
 	}
 	fn = resolve("pgtable_l5_enabled");
+	pr_info("[kerncall] pgtable_l5_enabled resolve=0x%lx\n", fn);
 	if (fn && ker_addr_ok(fn) &&
 	    !sc_safe_read(&v, (void *)fn, sizeof(v))) {
 		if (!reported) {
