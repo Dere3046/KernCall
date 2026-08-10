@@ -6,6 +6,8 @@ on:
       - 'src/**'
       - 'Makefile'
       - 'doc/**'
+      - 'deps/**'
+      - '.gitmodules'
       - '.github/workflows/build.yml'
   workflow_dispatch:
 
@@ -27,10 +29,12 @@ jobs:
       options: --privileged
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch KallRecon
+      - name: Fetch deps
         run: |
           git clone --depth 1 https://github.com/Dere3046/KallRecon.git deps/KallRecon
           git -C deps/KallRecon checkout 8d647f0
+          git clone --depth 1 https://github.com/Dere3046/Type_info.git deps/type_info
+          git -C deps/type_info checkout e33f3b4
       - name: Build
         run: make
       - uses: actions/upload-artifact@v4
