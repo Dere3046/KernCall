@@ -32,9 +32,7 @@ jobs:
       - name: Fetch deps
         run: |
           git clone --depth 1 https://github.com/Dere3046/KallRecon.git deps/KallRecon
-          git -C deps/KallRecon checkout 8d647f0
           git clone --depth 1 https://github.com/Dere3046/Type_info.git deps/type_info
-          git -C deps/type_info checkout aa514a6
       - name: Build
         run: make
       - uses: actions/upload-artifact@v4
