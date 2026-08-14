@@ -27,3 +27,7 @@ clean:
 ifneq ($(KERNSC_MINIMAL),1)
 ccflags-y += -DCONFIG_KERNSC_DISCOVER -DCONFIG_KERNSC_PATCH -DCONFIG_KERNSC_TP
 endif
+
+$(obj)/%.o: $(src)/%.c $(recordmcount_source) FORCE
+	$(call if_changed_rule,cc_o_c)
+	$(call cmd,force_checksrc)
