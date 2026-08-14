@@ -3,7 +3,8 @@
 kernel syscall channel library. hijacks a free `ni_syscall` slot in
 `sys_call_table` and routes userland `syscall(nr, key, cmd, ...)`
 calls to a dispatch callback. can also patch arbitrary existing
-syscall slots.
+syscall slots. optionally hosts a `sys_enter` tracepoint dispatcher
+for runtime syscall hooks that never touch the table.
 
 ## Layout injection
 
@@ -22,13 +23,17 @@ struct sc_layout {
 ```
 
 - `resolve`: symbol name to address. used for `sys_call_table`,
-  `__arm64_sys_ni_syscall` (+ `.cfi_jt`), `init_mm` and lazily for
-  `caches_clean_inval_pou`. on old-CFI kernels the wrapper must be
-  a `__nocfi` function around `kallrecon_klp`, passing the raw
-  pointer makes the module's indirect call check fail with a CFI
-  panic
-- `pgd_off`: byte offset of `mm_struct.pgd`, for the PTE walk that
-  makes the table writable. from BTF or an anchor scan
+  `__arm64_sys_ni_syscall` (+ `.cfi_jt`), `init_mm`, and lazily
+  for the patch write machinery (`kimage_voffset`, `__set_fixmap`,
+  `caches_clean_inval_pou` with `dcache_clean_inval_poc` /
+  `flush_dcache_range` fallbacks) and the tracepoint dispatcher
+  (`__tracepoint_sys_enter`, `tracepoint_srcu`,
+  `synchronize_srcu`). the wrapper must be a `__nocfi` function
+  around `kallrecon_klp`, passing the raw pointer makes the module's
+  indirect call check fail with a CFI panic on old-CFI kernels
+- `pgd_off`: byte offset of `mm_struct.pgd`. reserved, the current
+  fixmap based patch write does not use it. kept in the layout
+  struct so consumers can carry it for their own page table work
 - `find_slot`: optional empty-slot discovery method supplied by the
   layout library. see Slot discovery
 
@@ -39,21 +44,24 @@ struct sc_layout {
 the one call that starts everything. resolves symbols, discovers a
 slot, patches in the handler. 0 on success.
 -EINVAL when cfg, key or layout resolver is bad.
+-EALREADY when the channel is already initialized, call sc_exit
+first.
 -ENODATA when a required symbol cannot be resolved.
 -EBUSY when no slot is found. -EIO when the patch fails.
 not reentrant: a second sc_init while the channel is active fails
-with -EIO, call sc_exit first.
+with -EALREADY.
 
 with `cfg->no_patch` set, sc_init only resolves the layout
 (symbols + pgd ready) and returns without discovering or patching
 a channel slot. consumers use this to build their own handler on
 top of the patch API, keeping the built-in channel (and its auth
-error codes) out of the syscall table.
+error codes) out of the syscall table. `tp_enable` still works
+under no_patch, giving a channel-free tracepoint dispatcher.
 
 **void sc_exit(void)**
 
-restores every patched slot and unregisters. safe to call multiple
-times.
+restores every patched slot, unregisters the tracepoint dispatcher
+if enabled, and unmarks processes. safe to call multiple times.
 
 **int sc_get_slot(void)**
 
@@ -68,6 +76,12 @@ struct sc_cfg {
 	int (*find_slot)(void);
 	char key[SC_KEY_MAX];
 	void *priv;
+	bool no_patch;
+	/* tracepoint dispatcher (CONFIG_KERNSC_TP) */
+	bool tp_enable;
+	bool tp_mark_all;
+	void (*tp_mark_cb)(struct task_struct *p, bool on);
+	void (*tp_on_enter)(int id, struct pt_regs *regs);
 };
 ```
 
@@ -101,6 +115,91 @@ syscall argument.
 **priv**
 
 caller supplied context, forwarded to dispatch.
+
+## Tracepoint dispatcher (CONFIG_KERNSC_TP)
+
+a `sys_enter` tracepoint based dispatcher. one shared `ni_syscall`
+slot is patched with a dispatcher handler; the tracepoint redirects
+only hooked syscalls to it, and an in-module table routes them to
+per-syscall hooks. hooks register and unregister at runtime without
+writing the read-only syscall table. the advantage over `sc_patch`
+is one table write for any number of hooks, at the cost of marking
+processes and passing every marked syscall through the tracepoint.
+
+**lifecycle**
+
+set `tp_enable` in cfg and pass it to sc_init. the dispatcher finds
+its own free slot (excluding the channel slot and patched entries),
+patches it, registers the tracepoint and marks processes. all of it
+is torn down by sc_exit. works together with the channel and with
+no_patch mode.
+
+**process marking**
+
+marked processes get `TIF_SYSCALL_TRACEPOINT` and their syscalls
+fire the tracepoint. `tp_mark_all` true (default) marks every
+process, false marks only the current task. `tp_mark_cb` replaces
+the built-in flag toggling with a consumer callback
+`void (*)(struct task_struct *p, bool on)`, for selective marking.
+
+**tp_on_enter**
+
+optional observer `void (*)(int id, struct pt_regs *regs)`. called
+for every syscall of a marked process, before the redirect check.
+use it to watch or adjust registers of unhooked syscalls.
+
+**int sc_tp_register(int nr, sc_tp_hook_fn fn)**
+
+route syscall nr to fn. -EINVAL for bad nr or NULL fn. -EEXIST when
+nr is already hooked. no table write happens.
+
+**void sc_tp_unregister(int nr)**
+
+stop routing nr. silent for unhooked nr.
+
+**bool sc_tp_hooked(int nr)**
+
+true when nr has a registered hook.
+
+**long sc_tp_orig(int nr, const struct pt_regs *regs)**
+
+call the current table entry for nr. the standard way for a hook to
+chain to the original syscall. the internal call is `__nocfi`, the
+table entry typeid matches the syscall_fn_t signature. hook
+signature:
+
+```c
+typedef long (*sc_tp_hook_fn)(int nr, const struct pt_regs *regs);
+```
+
+the typedef carries the KCFI typeid, so the dispatcher's indirect
+call is check-compatible.
+
+**int sc_tp_slot(void)**
+
+the dispatcher slot number. -1 when disabled.
+
+**slot discovery**
+
+the dispatcher scans `sys_call_table` for a ni entry, skipping the
+channel slot and every patched slot. consumer find_slot callbacks
+are not consulted, they already own the channel slot selection.
+
+**slot conflicts**
+
+registering a hook on the dispatcher slot itself is allowed but
+never fires: the sys_enter handler skips the redirect for the
+dispatcher slot, so direct calls keep the ni behavior. registering
+on the channel slot routes calls through the hook, then sc_tp_orig,
+then sc_handler, so the channel stays reachable as long as the hook
+passes through.
+
+**teardown**
+
+sc_exit unregisters the tracepoint, then resolves `tracepoint_srcu`
+and calls `synchronize_srcu` to wait out in-flight probes before
+freeing module memory. on kernels where those symbols are trimmed
+by CONFIG_TRIM_UNUSED_KSYMS it falls back to `synchronize_rcu`.
 
 ## Slot discovery
 
@@ -183,20 +282,38 @@ wrapper), so a failed read never faults.
 
 **patch write**
 
-makes the table entry writable by flipping the PTE
-(`PTE_DBM` set, `PTE_RDONLY` cleared), writing the new value,
-restoring the PTE, then TLB flushing and cache cleaning
-(`caches_clean_inval_pou`, resolved lazily, skipped when the
-symbol is missing). the PTE bits are arm64 hardware bits, stable
-across all kernel versions.
+writes to read-only kernel text through the fixmap slot. the target
+virtual address is translated to physical with `kimage_voffset`
+(read from the kernel image, VA_BITS independent), then
+`FIX_TEXT_POKE0` is mapped to the page with `PAGE_KERNEL`
+(`__set_fixmap`, resolved lazily), the 8 bytes are written through
+the fixmap alias, the mapping is removed and the cache is cleaned
+(`caches_clean_inval_pou`, falling back to
+`dcache_clean_inval_poc` then `flush_dcache_range`, all resolved
+lazily and skipped when every symbol is missing). the whole
+sequence runs under a spinlock. swapper_pg_dir lives in read-only
+memory, so PTE flipping is not an option here.
 
 **KCFI**
 
-the handler is a plain function compiled by the same clang as the
-kernel with the signature `long (*)(const struct pt_regs *)`, so
-clang emits the matching typeid and the `invoke_syscall` KCFI
-check passes. do not mark the handler `__nocfi` (empty macro on
-arm64) and do not use `no_sanitize("kcfi")` (mismatching typeid).
+two roles, two rules.
+
+the handler patched into `sys_call_table` (the channel handler, the
+dispatcher) is a plain function with the `long (*)(const struct
+pt_regs *)` signature, compiled by the same clang as the kernel, so
+clang emits the matching typeid and the `invoke_syscall` KCFI check
+passes. do not mark it `__nocfi` and do not use
+`no_sanitize("kcfi")`, the incoming check reads the typeid at the
+function entry.
+
+every caller that invokes a kernel function through a runtime
+resolved pointer carries `__nocfi` (sc_tp_orig calling the table
+entry, the internal cache clean / fixmap / srcu sync helpers, and
+the consumer supplied resolve wrapper). `__nocfi` is real on GKI:
+5.10 defines it unconditionally as `no_sanitize("cfi")`, KCFI
+kernels define it as `no_sanitize("kcfi")` when the module compiles
+with the sanitizer. a bare resolved-pointer call can panic with a
+CFI failure on old-CFI kernels.
 
 ## Build options
 
@@ -204,5 +321,6 @@ arm64) and do not use `no_sanitize("kcfi")` (mismatching typeid).
 KDIR=...            kernel build dir, required
 KERNSC_MINIMAL=1    minimal build: custom syscall core only
                     (sc_init + handler + default discovery),
-                    patch and discovery APIs are compiled out
+                    patch, discovery and tracepoint dispatcher
+                    APIs are compiled out
 ```
