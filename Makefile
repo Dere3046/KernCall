@@ -25,7 +25,8 @@ clean:
 	make -C $(KDIR) M=$(ODIR) src=$(MDIR) clean
 
 ifneq ($(KERNSC_MINIMAL),1)
-ccflags-y += -DCONFIG_KERNSC_DISCOVER -DCONFIG_KERNSC_PATCH -DCONFIG_KERNSC_TP
+kerncall-y += lib/sc_sock.o
+ccflags-y += -DCONFIG_KERNSC_DISCOVER -DCONFIG_KERNSC_PATCH -DCONFIG_KERNSC_TP -DCONFIG_KERNSC_SOCK
 endif
 
 $(obj)/%.o: $(src)/%.c $(recordmcount_source) FORCE

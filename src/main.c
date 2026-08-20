@@ -13,6 +13,7 @@
 #include <asm/unistd.h>
 
 #include "sc.h"
+#include "sc_sock.h"
 
 extern unsigned long (*kallrecon_klp)(const char *name);
 extern void find_kallsyms_base(void);
@@ -113,6 +114,7 @@ static int demo_pgd_off(u32 *out)
 #define SC_TEST_TP_UNSELF    0x2017
 #define SC_TEST_TP_UNCHAN    0x2018
 #define SC_TEST_REINIT       0x2019
+#define SC_TEST_SOCK_EVENT   0x2020
 
 static long test_handler(const struct pt_regs *regs)
 {
@@ -239,6 +241,9 @@ static long demo_dispatch(long cmd, const struct pt_regs *regs, void *priv)
 #endif
 	case SC_TEST_REINIT:
 		return sc_init(&g_cfg);
+	case SC_TEST_SOCK_EVENT:
+		return sc_sock_send_event("kerncall-sock-event",
+					  sizeof("kerncall-sock-event") - 1);
 	default:
 		return -ENOSYS;
 	}
@@ -289,13 +294,33 @@ static int __init kerncall_init(void)
 	}
 #endif
 
-	pr_info("[kerncall] loaded slot=%d tp=%d\n", sc_get_slot(),
-		sc_tp_slot());
+#ifdef CONFIG_KERNSC_SOCK
+	ret = sc_sock_init(NULL);
+	if (ret)
+		pr_warn("[kerncall] sc_sock init failed %d\n", ret);
+#endif
+
+	pr_info("[kerncall] loaded slot=%d tp=%d sock_family=%d\n",
+		sc_get_slot(),
+#ifdef CONFIG_KERNSC_TP
+		sc_tp_slot(),
+#else
+		-1,
+#endif
+#ifdef CONFIG_KERNSC_SOCK
+		sc_sock_family()
+#else
+		-1
+#endif
+		);
 	return 0;
 }
 
 static void __exit kerncall_exit(void)
 {
+#ifdef CONFIG_KERNSC_SOCK
+	sc_sock_exit();
+#endif
 	sc_exit();
 	pr_info("[kerncall] unloaded\n");
 }

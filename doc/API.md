@@ -272,48 +272,85 @@ this way internally.
 
 restore the original entry. silent when nr is not patched.
 
-## Behavior
+## Socket protocol family (sc_sock)
 
-**safe read**
+a custom socket protocol family for kernel to userland event
+streaming. no `/dev` node, no filesystem dependency. the family is
+registered as a library component, consumers link `sc_sock.o` and
+call the API directly.
 
-all kernel memory reads (table entries, pgd pointer, orig values)
-go through an internal `sc_safe_read` (copy_from_kernel_nofault
-wrapper), so a failed read never faults.
+**int sc_sock_init(const struct sc_sock_consumer_ops *ops)**
 
-**patch write**
+register the protocol and scan a free family number starting from
+`AF_DECnet`. ops is optional, NULL is allowed. 0 on success,
+-EADDRINUSE when no free family is found.
 
-writes to read-only kernel text through the fixmap slot. the target
-virtual address is translated to physical with `kimage_voffset`
-(read from the kernel image, VA_BITS independent), then
-`FIX_TEXT_POKE0` is mapped to the page with `PAGE_KERNEL`
-(`__set_fixmap`, resolved lazily), the 8 bytes are written through
-the fixmap alias, the mapping is removed and the cache is cleaned
-(`caches_clean_inval_pou`, falling back to
-`dcache_clean_inval_poc` then `flush_dcache_range`, all resolved
-lazily and skipped when every symbol is missing). the whole
-sequence runs under a spinlock. swapper_pg_dir lives in read-only
-memory, so PTE flipping is not an option here.
+**void sc_sock_exit(void)**
 
-**KCFI**
+unregister the protocol and family. module refcount is held per open
+socket, so unload is blocked while sockets are alive.
 
-two roles, two rules.
+**int sc_sock_family(void)**
 
-the handler patched into `sys_call_table` (the channel handler, the
-dispatcher) is a plain function with the `long (*)(const struct
-pt_regs *)` signature, compiled by the same clang as the kernel, so
-clang emits the matching typeid and the `invoke_syscall` KCFI check
-passes. do not mark it `__nocfi` and do not use
-`no_sanitize("kcfi")`, the incoming check reads the typeid at the
-function entry.
+the registered family number, -1 before init or after exit.
 
-every caller that invokes a kernel function through a runtime
-resolved pointer carries `__nocfi` (sc_tp_orig calling the table
-entry, the internal cache clean / fixmap / srcu sync helpers, and
-the consumer supplied resolve wrapper). `__nocfi` is real on GKI:
-5.10 defines it unconditionally as `no_sanitize("cfi")`, KCFI
-kernels define it as `no_sanitize("kcfi")` when the module compiles
-with the sanitizer. a bare resolved-pointer call can panic with a
-CFI failure on old-CFI kernels.
+**int sc_sock_send_event(const void *data, size_t len)**
+
+broadcast one event to every open sc_sock socket. -ENODEV when the
+family is not registered, -EINVAL for NULL data or bad length,
+-ENOMEM when skb allocation fails. `SC_SOCK_EVENT_MAX` bounds the
+event size.
+
+**int sc_sock_send_event_to(const void *data, size_t len, struct socket *sock)**
+
+send one event to a single socket.
+
+**void *sc_sock_priv(struct socket *sock)**
+
+per-socket consumer private data, NULL when unset.
+
+**int sc_sock_set_priv(struct socket *sock, void *priv)**
+
+set per-socket consumer private data.
+
+```c
+struct sc_sock_consumer_ops {
+	int (*ioctl)(struct socket *sock, unsigned int cmd,
+		     unsigned long arg);
+	int (*sendmsg)(struct socket *sock, struct msghdr *msg, size_t len);
+	int (*mmap)(struct file *file, struct socket *sock,
+		    struct vm_area_struct *vma);
+	int (*setsockopt)(struct socket *sock, int level, int optname,
+			  sockptr_t optval, unsigned int optlen);
+	int (*getsockopt)(struct socket *sock, int level, int optname,
+			  char __user *optval, int __user *optlen);
+};
+```
+
+the consumer ops are optional extension points. when NULL, ioctl,
+sendmsg, mmap, setsockopt and unknown getsockopt return the default
+-EOPNOTSUPP / -ENOTTY / -ENOPROTOOPT.
+
+userspace protocol:
+
+```c
+#define SC_SOCK_PROTO 0x53
+#define SC_SOCK_LEVEL 0x5343
+#define SC_SOCK_OPT_HELLO 0x1000
+#define SC_SOCK_OPT_FAMILY 0x1001
+
+int fd = socket(AF_DECnet, SOCK_RAW, SC_SOCK_PROTO);
+int val;
+socklen_t len = sizeof(val);
+
+getsockopt(fd, SC_SOCK_LEVEL, SC_SOCK_OPT_HELLO, &val, &len);
+getsockopt(fd, SC_SOCK_LEVEL, SC_SOCK_OPT_FAMILY, &val, &len);
+recv(fd, buf, sizeof(buf), 0);
+```
+
+socket creation requires `CAP_NET_BIND_SERVICE`. events are queued
+per socket and read with recv. recv blocks when no event is queued
+unless MSG_DONTWAIT is set.
 
 ## Build options
 
@@ -321,6 +358,6 @@ CFI failure on old-CFI kernels.
 KDIR=...            kernel build dir, required
 KERNSC_MINIMAL=1    minimal build: custom syscall core only
                     (sc_init + handler + default discovery),
-                    patch, discovery and tracepoint dispatcher
-                    APIs are compiled out
+                    patch, discovery, tracepoint dispatcher and
+                    sc_sock are compiled out
 ```
