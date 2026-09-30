@@ -266,6 +266,21 @@ and calls `synchronize_srcu` to wait out in-flight probes before
 freeing module memory. on kernels where those symbols are trimmed
 by CONFIG_TRIM_UNUSED_KSYMS it falls back to `synchronize_rcu`.
 
+## Write path
+
+`sc_patch` writes the table through HooKern, and `sc_cfg.patch_mode` says which of
+that library's write paths it takes. 0 keeps the historical behaviour, the fixmap
+slot the library maps itself. `HK_PATCH_MODE_INSN_PATCH` writes through the
+kernel's own `aarch64_insn_patch_text`, which is the only path a platform layer
+that refuses a self mapped alias lets through (MTK's MKP is such a layer, its
+hypervisor watches the fixmap range and treats the kernel's own patch path as the
+normal one). `HK_PATCH_MODE_FIXMAP` borrows the kernel's own text poke slot and
+keeps the byte wide write.
+
+**unsigned int sc_get_patch_mode(void)** and **void
+sc_set_patch_mode(unsigned int mode)** read and change it at runtime, the value
+is the mode field of HooKern's flags word.
+
 ## Slot discovery
 
 selection order, first hit wins:

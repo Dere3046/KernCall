@@ -133,6 +133,14 @@ struct sc_cfg {
 	unsigned int ncmds;
 	bool replay_enable;
 	unsigned long replay_ttl_ms;
+	/*
+	 * the write path the patch calls take, an HK_PATCH_MODE_* value from
+	 * HooKern. 0 keeps the historical behaviour, which is the slot path of
+	 * that library. a device whose platform layer refuses a self mapped
+	 * alias wants HK_PATCH_MODE_INSN_PATCH, which writes through the
+	 * kernel's own patch primitive
+	 */
+	unsigned int patch_mode;
 	u64 (*replay_sid)(const struct pt_regs *regs, void *priv);
 #ifdef CONFIG_KERNSC_TP
 	bool tp_enable;
@@ -187,6 +195,13 @@ int sc_find_slot_scan(void);
 
 #ifdef CONFIG_KERNSC_PATCH
 int sc_patch(unsigned long nr, unsigned long handler, unsigned long *orig_out);
+
+/*
+ * the write path of every later patch call. the value is the mode field of
+ * HooKern's flags word, see that library's header for the choices
+ */
+unsigned int sc_get_patch_mode(void);
+void sc_set_patch_mode(unsigned int mode);
 void sc_unpatch(unsigned long nr);
 #endif
 
