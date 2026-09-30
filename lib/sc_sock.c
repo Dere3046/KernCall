@@ -396,3 +396,10 @@ int sc_sock_set_priv(struct socket *sock, void *priv)
 	ss->priv = priv;
 	return 0;
 }
+
+struct file *sc_sock_file(struct socket *sock)
+{
+	if (!sock)
+		return NULL;
+	return sock->file;
+}

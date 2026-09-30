@@ -38,4 +38,7 @@ int sc_sock_send_event_to(const void *data, size_t len, struct socket *sock);
 void *sc_sock_priv(struct socket *sock);
 int sc_sock_set_priv(struct socket *sock, void *priv);
 
+/* the file of the socket, the handle sc_fd_perm_grant takes */
+struct file *sc_sock_file(struct socket *sock);
+
 #endif

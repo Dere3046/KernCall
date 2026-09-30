@@ -1,7 +1,13 @@
 obj-m := kerncall.o
 
 kerncall-y := src/main.o lib/sc.o lib/sc_slide.o \
-	deps/KallRecon/lib/core.o deps/KallRecon/lib/slide.o deps/KallRecon/lib/anchor.o
+	deps/KallRecon/lib/core.o deps/KallRecon/lib/slide.o deps/KallRecon/lib/anchor.o \
+	deps/HooKern/lib/hk.o deps/HooKern/lib/hk_ksym.o \
+	deps/HooKern/lib/hk_patch.o deps/HooKern/lib/hk_flush.o \
+	deps/HooKern/lib/hk_ptr.o deps/HooKern/lib/hk_inline.o \
+	deps/HooKern/lib/hk_kprobe.o deps/HooKern/lib/hk_kretprobe.o \
+	deps/HooKern/lib/hk_sighook.o deps/HooKern/lib/hk_cfi.o \
+	deps/HooKern/lib/hk_binder.o
 
 ccflags-y += -std=gnu11
 ccflags-y += -Wno-declaration-after-statement
@@ -10,6 +16,7 @@ ccflags-y += -Wno-unused-function
 ccflags-y += -Wno-strict-prototypes
 ccflags-y += -I$(src)/lib
 ccflags-y += -I$(src)/deps/KallRecon/lib
+ccflags-y += -I$(src)/deps/HooKern/lib
 
 KDIR := $(KDIR)
 MDIR := $(realpath $(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
@@ -20,9 +27,10 @@ $(info -- MDIR: $(MDIR))
 $(info -- ODIR: $(ODIR))
 
 all:
-	make -C $(KDIR) M=$(ODIR) src=$(MDIR) modules
+	mkdir -p $(ODIR)
+	make -C $(KDIR) M=$(ODIR) src=$(MDIR) srcroot=$(MDIR) modules
 clean:
-	make -C $(KDIR) M=$(ODIR) src=$(MDIR) clean
+	make -C $(KDIR) M=$(ODIR) src=$(MDIR) srcroot=$(MDIR) clean
 
 ifneq ($(KERNSC_MINIMAL),1)
 kerncall-y += lib/sc_sock.o
