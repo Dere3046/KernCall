@@ -99,24 +99,14 @@ int sc_safe_read(void *dst, const void *src, size_t sz)
  * stays HooKern's own choice: the slot enum of this build is not the one of
  * the running kernel, and every writer of the library shares one lock anyway
  */
-static unsigned int g_patch_mode;
-
-unsigned int sc_get_patch_mode(void)
-{
-	return g_patch_mode;
-}
-
-void sc_set_patch_mode(unsigned int mode)
-{
-	g_patch_mode = mode;
-}
+static int (*g_patch_write)(void *addr, unsigned long val, void *priv);
+static void *g_patch_priv;
 
 static int sc_patch_write(void *addr, unsigned long val)
 {
-	return hk_patch_write_at(addr, val,
-				 HK_PATCH_FLAGS_MODE(g_patch_mode) |
-				 HK_PATCH_FLUSH_DCACHE |
-				 HK_PATCH_FLUSH_ICACHE);
+	if (g_patch_write)
+		return g_patch_write(addr, val, g_patch_priv);
+	return hk_patch_write(addr, val);
 }
 
 static int sc_hk_init(void)
@@ -1134,7 +1124,8 @@ int sc_init(const struct sc_cfg *cfg)
 		return -EINVAL;
 	}
 
-	g_patch_mode = cfg->patch_mode;
+	g_patch_write = cfg->patch_write;
+	g_patch_priv = cfg->patch_priv;
 
 	g_key_len = strnlen(cfg->key, SC_KEY_MAX);
 	memcpy(g_key, cfg->key, g_key_len + 1);

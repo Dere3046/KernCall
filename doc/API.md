@@ -268,18 +268,29 @@ by CONFIG_TRIM_UNUSED_KSYMS it falls back to `synchronize_rcu`.
 
 ## Write path
 
-`sc_patch` writes the table through HooKern, and `sc_cfg.patch_mode` says which of
-that library's write paths it takes. 0 keeps the historical behaviour, the fixmap
-slot the library maps itself. `HK_PATCH_MODE_INSN_PATCH` writes through the
-kernel's own `aarch64_insn_patch_text`, which is the only path a platform layer
-that refuses a self mapped alias lets through (MTK's MKP is such a layer, its
-hypervisor watches the fixmap range and treats the kernel's own patch path as the
-normal one). `HK_PATCH_MODE_FIXMAP` borrows the kernel's own text poke slot and
-keeps the byte wide write.
+`sc_patch` writes the table through a function the consumer supplies:
+`sc_cfg.patch_write`, with `sc_cfg.patch_priv` handed back to it. NULL keeps the
+library default, `hk_patch_write`, which is the path `hk_init` was configured
+with, so a consumer that supplies nothing gets whatever it chose for HooKern.
 
-**unsigned int sc_get_patch_mode(void)** and **void
-sc_set_patch_mode(unsigned int mode)** read and change it at runtime, the value
-is the mode field of HooKern's flags word.
+A consumer that wants another path, a fallback, or a test before the write
+supplies its own:
+
+```c
+static int my_write(void *addr, unsigned long val, void *priv)
+{
+	if (hk_va_writable((unsigned long)addr))
+		return hk_write_direct(addr, &val, sizeof(val));
+	if (!hk_write_fixmap(addr, &val, sizeof(val)))
+		return 0;
+	return hk_write_kernel(addr, &val, sizeof(val));
+}
+
+struct sc_cfg cfg = { ... .patch_write = my_write };
+```
+
+The library keeps no policy of its own about this and no state beyond the two
+pointers.
 
 ## Slot discovery
 
