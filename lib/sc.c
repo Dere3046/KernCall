@@ -106,6 +106,8 @@ static int sc_patch_write(void *addr, unsigned long val)
 {
 	if (g_patch_write)
 		return g_patch_write(addr, val, g_patch_priv);
+	if (g_cfg->write)
+		return hk_write_run(addr, &val, sizeof(val), g_cfg->write);
 	return hk_patch_write(addr, val);
 }
 

@@ -8,6 +8,8 @@
 
 #include <linux/types.h>
 
+struct hk_write;
+
 #define SC_KEY_MAX 64
 #define SC_CMD_HELLO 0x1000
 #define SC_CMD_SESSION 0x1001
@@ -142,6 +144,12 @@ struct sc_cfg {
 	 */
 	int (*patch_write)(void *addr, unsigned long val, void *priv);
 	void *patch_priv;
+	/*
+	 * the descriptor the default path writes through, so a consumer picks the slot
+	 * and the read back without replacing the whole path. a zero one keeps the
+	 * library default, which is the kernel primitive
+	 */
+	const struct hk_write *write;
 	u64 (*replay_sid)(const struct pt_regs *regs, void *priv);
 #ifdef CONFIG_KERNSC_TP
 	bool tp_enable;
