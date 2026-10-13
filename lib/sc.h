@@ -202,6 +202,52 @@ unsigned long sc_entry(unsigned long nr);
 int sc_find_slot_scan(void);
 #endif
 
+#ifdef CONFIG_KERNSC_REDIR
+/*
+ * the table entry of a syscall is read only data in the kernel image, and on a
+ * kernel whose image is kept read only by something this module cannot write
+ * through, the slot cannot be patched at all. this route leaves the table alone: it
+ * reads the entry, arms a breakpoint on the function the entry points at, and that
+ * function is what a call lands on, so the replacement runs in its place. a reader
+ * of the table still sees the original handler, and the price is one breakpoint per
+ * call, which is what a slot holding a function with a hot path costs
+ *
+ * fn is reached with the registers of the syscall, exactly like the function it
+ * replaces, and it reaches the original by calling sc_redir_orig, which calls what
+ * the entry points at. that call lands on the same breakpoint, and the library lets
+ * it through for a task that is already inside fn, so the original instruction and
+ * the body behind it run
+ *
+ * fn clears that marker through sc_redir_leave before it returns, once per call. a
+ * function that never clears it stops being redirected for that task and the
+ * original runs from then on, which is a lost hook and not a crash
+ *
+ *	__nocfi long my_fn(const struct pt_regs *regs)
+ *	{
+ *		long ret = sc_redir_orig(MY_NR, regs);
+ *
+ *		sc_redir_leave(MY_NR);
+ *		return ret;
+ *	}
+ *
+ * two syscall numbers whose entries hold the same function cannot both be
+ * redirected: the kernel runs one handler of an address and a second probe there
+ * would never be reached, so the install is refused with -EEXIST instead of being
+ * installed dead. one redirect serves all of them, and fn tells the numbers apart
+ * by reading regs->syscallno
+ */
+typedef long (*sc_redir_fn)(const struct pt_regs *regs);
+
+/* arm the redirect, -EEXIST when nr or the entry it points at is already taken */
+int sc_redir(unsigned long nr, sc_redir_fn fn, unsigned long *orig_out);
+void sc_unredir(unsigned long nr);
+bool sc_redir_hooked(unsigned long nr);
+/* clear the marker of the redirect of nr, called by fn once per call */
+void sc_redir_leave(unsigned long nr);
+/* call what the entry of nr points at, the way a replacement reaches the original */
+long sc_redir_orig(unsigned long nr, const struct pt_regs *regs);
+#endif
+
 #ifdef CONFIG_KERNSC_PATCH
 int sc_patch(unsigned long nr, unsigned long handler, unsigned long *orig_out);
 

@@ -5,7 +5,8 @@ kerncall-y := src/main.o lib/sc.o lib/sc_slide.o \
 	deps/HooKern/lib/hk.o deps/HooKern/lib/hk_ksym.o \
 	deps/HooKern/lib/hk_patch.o deps/HooKern/lib/hk_flush.o \
 	deps/HooKern/lib/hk_ptr.o deps/HooKern/lib/hk_inline.o \
-	deps/HooKern/lib/hk_kprobe.o deps/HooKern/lib/hk_kretprobe.o \
+	deps/HooKern/lib/hk_kprobe.o deps/HooKern/lib/hk_redir.o \
+	deps/HooKern/lib/hk_kretprobe.o \
 	deps/HooKern/lib/hk_sighook.o deps/HooKern/lib/hk_cfi.o \
 	deps/HooKern/lib/hk_binder.o
 
@@ -34,7 +35,7 @@ clean:
 
 ifneq ($(KERNSC_MINIMAL),1)
 kerncall-y += lib/sc_sock.o
-ccflags-y += -DCONFIG_KERNSC_DISCOVER -DCONFIG_KERNSC_PATCH -DCONFIG_KERNSC_TP -DCONFIG_KERNSC_SOCK
+ccflags-y += -DCONFIG_KERNSC_DISCOVER -DCONFIG_KERNSC_PATCH -DCONFIG_KERNSC_TP -DCONFIG_KERNSC_REDIR -DCONFIG_KERNSC_SOCK
 endif
 
 $(obj)/%.o: $(src)/%.c $(recordmcount_source) FORCE

@@ -16,19 +16,22 @@
 #include <linux/sched/signal.h>
 #include <linux/atomic.h>
 #include <linux/timekeeping.h>
+#include <linux/ptrace.h>
 #ifdef CONFIG_KERNSC_TP
 #include <linux/compat.h>
-#include <linux/ptrace.h>
 #include <linux/rcupdate.h>
 #include <linux/srcu.h>
 #include <linux/thread_info.h>
 #include <linux/tracepoint.h>
+#endif
+#if defined(CONFIG_KERNSC_TP) || defined(CONFIG_KERNSC_REDIR)
 #include <asm/unistd.h>
 #endif
 
 #include "hk.h"
 #include "hk_kretprobe.h"
 #include "hk_patch.h"
+#include "hk_redir.h"
 #include "sc.h"
 #include "sc_slide.h"
 
@@ -93,11 +96,11 @@ int sc_safe_read(void *dst, const void *src, size_t sz)
 }
 
 /*
- * the write goes through the HooKern patch entry, which parks the other cores
- * with stop_machine and uses the kernel's own instruction patch primitive, so
- * a failed write is reported instead of being written anyway. the fixmap slot
- * stays HooKern's own choice: the slot enum of this build is not the one of
- * the running kernel, and every writer of the library shares one lock anyway
+ * the write goes through the HooKern patch entry, which parks the other cores with
+ * stop_machine and maps the page through the kernel's own fixmap slot, so a failed
+ * write is reported instead of being written anyway. the default path reads the
+ * entry back, because a table write that lands nowhere is the failure this channel
+ * cannot see otherwise: the value the caller gets is the value the table holds
  */
 static int (*g_patch_write)(void *addr, unsigned long val, void *priv);
 static void *g_patch_priv;
@@ -108,7 +111,7 @@ static int sc_patch_write(void *addr, unsigned long val)
 		return g_patch_write(addr, val, g_patch_priv);
 	if (g_cfg->write)
 		return hk_write_run(addr, &val, sizeof(val), g_cfg->write);
-	return hk_patch_write(addr, val);
+	return hk_write_poke(addr, &val, sizeof(val));
 }
 
 static int sc_hk_init(void)
@@ -689,11 +692,158 @@ void sc_unpatch(unsigned long nr)
 }
 #endif
 
-#ifdef CONFIG_KERNSC_TP
-#define TP_ORIG_NR(r) ((r)->regs[8])
-
+#if defined(CONFIG_KERNSC_TP) || defined(CONFIG_KERNSC_REDIR)
 /* avoid the const sys_call_table declared in asm/syscall.h */
 typedef long (*syscall_fn_t)(const struct pt_regs *regs);
+
+/*
+ * call what the entry of nr points at. every route that has to reach the original
+ * reads the entry here and keeps no copy, so a slot another writer moved is
+ * answered with what it holds now
+ */
+static long __nocfi sc_call_entry(unsigned long nr, const struct pt_regs *regs)
+{
+	unsigned long orig;
+	syscall_fn_t fn;
+
+	if (nr >= __NR_syscalls)
+		return -EINVAL;
+	if (!sys_call_table)
+		return -ENODATA;
+	if (sc_safe_read(&orig, &sys_call_table[nr], sizeof(orig)))
+		return -EFAULT;
+	if (!orig)
+		return -ENODATA;
+	fn = (syscall_fn_t)orig;
+	return fn(regs);
+}
+#endif
+
+#ifdef CONFIG_KERNSC_REDIR
+#define SC_REDIR_MAX 16
+
+/*
+ * one redirect. the table entry keeps its value, so what carries a call is the
+ * breakpoint on the function the entry points at, and nr is only the name the
+ * caller gave that function
+ */
+struct sc_redir_slot {
+	unsigned long nr;
+	unsigned long handler;
+	sc_redir_fn fn;
+	struct hk_redir redir;
+	bool used;
+};
+
+static struct sc_redir_slot g_redirs[SC_REDIR_MAX];
+
+static struct sc_redir_slot *redir_find(unsigned long nr)
+{
+	int i;
+
+	for (i = 0; i < SC_REDIR_MAX; i++) {
+		if (g_redirs[i].used && g_redirs[i].nr == nr)
+			return &g_redirs[i];
+	}
+	return NULL;
+}
+
+int sc_redir(unsigned long nr, sc_redir_fn fn, unsigned long *orig_out)
+{
+	struct sc_redir_slot *slot = NULL;
+	unsigned long handler;
+	int i;
+	int ret;
+
+	if (!sys_call_table)
+		return -ENODATA;
+	if (!fn || nr >= __NR_syscalls)
+		return -EINVAL;
+	if (sc_safe_read(&handler, &sys_call_table[nr],
+			  sizeof(handler)))
+		return -EFAULT;
+	if (!handler)
+		return -ENODATA;
+
+	for (i = 0; i < SC_REDIR_MAX; i++) {
+		if (!g_redirs[i].used) {
+			if (!slot)
+				slot = &g_redirs[i];
+			continue;
+		}
+		if (g_redirs[i].nr == nr)
+			return -EEXIST;
+		/*
+		 * the kernel runs one handler of an address, so a second probe on the
+		 * same function is never reached. an entry shared by several syscall
+		 * numbers, which is what an empty slot holds, takes one redirect, and
+		 * fn tells the numbers apart by reading regs->syscallno
+		 */
+		if (g_redirs[i].handler == handler)
+			return -EEXIST;
+	}
+	/* a patched slot holds a handler of this module, a breakpoint there is not it */
+	for (i = 0; i < SC_PATCH_MAX; i++) {
+		if (g_patches[i].used && g_patches[i].nr == nr)
+			return -EEXIST;
+	}
+	if (!slot)
+		return -ENOSPC;
+
+	ret = hk_redir_install_at(&slot->redir, handler, (unsigned long)fn,
+				  HK_REDIR_KPROBE);
+	if (ret)
+		return ret;
+
+	slot->fn = fn;
+	slot->handler = handler;
+	slot->nr = nr;
+	slot->used = true;
+	if (orig_out)
+		*orig_out = handler;
+	pr_info("[kerncall] redirect nr=%lu handler=0x%lx\n", nr, handler);
+	return 0;
+}
+
+void sc_unredir(unsigned long nr)
+{
+	struct sc_redir_slot *slot = redir_find(nr);
+	int ret;
+
+	if (!slot)
+		return;
+
+	ret = hk_redir_remove(&slot->redir);
+	if (ret) {
+		/* the probe is still armed, the exit path counts it and blocks on it */
+		pr_warn("[kerncall] redirect nr=%lu not taken back %d\n", nr, ret);
+		return;
+	}
+	slot->used = false;
+	slot->fn = NULL;
+}
+
+bool sc_redir_hooked(unsigned long nr)
+{
+	return redir_find(nr) != NULL;
+}
+
+void sc_redir_leave(unsigned long nr)
+{
+	struct sc_redir_slot *slot = redir_find(nr);
+
+	if (slot)
+		hk_redir_leave(&slot->redir);
+}
+
+long sc_redir_orig(unsigned long nr, const struct pt_regs *regs)
+{
+	return sc_call_entry(nr, regs);
+}
+#endif
+
+#ifdef CONFIG_KERNSC_TP
+#define TP_ORIG_NR(r) ((r)->regs[8])
 
 typedef void (*srcu_sync_fn)(struct srcu_struct *sp);
 
@@ -942,19 +1092,9 @@ bool sc_tp_hooked(int nr)
 
 long __nocfi sc_tp_orig(int nr, const struct pt_regs *regs)
 {
-	unsigned long orig;
-	syscall_fn_t fn;
-
-	if (nr < 0 || nr >= __NR_syscalls)
+	if (nr < 0)
 		return -EINVAL;
-	if (!sys_call_table)
-		return -ENODATA;
-	if (sc_safe_read(&orig, &sys_call_table[nr], sizeof(orig)))
-		return -EFAULT;
-	if (!orig)
-		return -ENODATA;
-	fn = (syscall_fn_t)orig;
-	return fn(regs);
+	return sc_call_entry((unsigned long)nr, regs);
 }
 
 int sc_tp_slot(void)
@@ -1216,6 +1356,12 @@ void sc_exit(void)
 		if (g_patches[i].used)
 			unpatch_slot(g_patches[i].nr);
 	}
+#ifdef CONFIG_KERNSC_REDIR
+	for (i = 0; i < SC_REDIR_MAX; i++) {
+		if (g_redirs[i].used)
+			sc_unredir(g_redirs[i].nr);
+	}
+#endif
 	for (i = 0; i < SC_FD_PERM_MAX; i++) {
 		if (g_fd_perms[i].file)
 			sc_fd_perm_take(i, NULL);
